@@ -1,0 +1,403 @@
+esphome:
+  name: meter-dlms-rs485-2
+  friendly_name: Meter DLMS RS485
+
+esp32:
+  board: esp32-s3-devkitc-1 
+  framework:
+    type: arduino
+
+logger:
+  level: DEBUG
+
+api:
+ota:
+  - platform: esphome
+web_server:
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "meter-dlms-fallback"
+    password: !secret wifi_password
+
+substitutions:
+  KEEPALIVE_PERIOD: 25s       
+  KEEPALIVE_ON_MS: 5000ms
+
+
+# ---------- UART / RS-485 ----------
+uart:
+  id: rs485
+  rx_pin: 
+    number: GPIO1 
+    inverted: false
+  tx_pin: 
+    number: GPIO2 
+    inverted: false
+  baud_rate: 9600
+  parity: NONE
+  stop_bits: 1
+  rx_buffer_size: 512
+  debug:
+    direction: RX
+    dummy_receiver: false
+
+# ---------- DIODA ----------
+
+light:
+  - platform: neopixelbus
+    id: onboard_led
+    name: "Onboard RGB"
+    pin: GPIO35
+    num_leds: 1
+    variant: SK6812
+    type: GRB                
+    default_transition_length: 0s
+    restore_mode: ALWAYS_OFF
+    internal: True
+
+switch:
+  - platform: template
+    id: keepalive_led_enable
+    name: "Powerbank Keepalive LED"
+    optimistic: true
+    restore_mode: "RESTORE_DEFAULT_ON"
+
+# ---------- DLMS parser ----------
+globals:
+  - id: dlms_buf
+    type: std::vector<uint8_t>
+  - id: last_rx_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: last_frame_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+# Drain UART periodically; parse after a quiet gap
+interval:
+  - interval: 50ms
+    then:
+      - lambda: |-
+          while (id(rs485).available()) {
+            uint8_t b;
+            if (id(rs485).read_byte(&b)) {
+              id(dlms_buf).push_back(b);
+              id(last_rx_ms) = millis();
+            } else {
+              break;
+            }
+          }
+
+          auto &buf = id(dlms_buf);
+          if (buf.empty()) return;
+          if (millis() - id(last_rx_ms) <= 500) return;
+
+          auto match_obis = [](const uint8_t* ln, uint8_t A,uint8_t B,uint8_t C,uint8_t D,uint8_t E,uint8_t F){
+            return ln[0]==A && ln[1]==B && ln[2]==C && ln[3]==D && ln[4]==E && ln[5]==F;
+          };
+
+          size_t i = 0;
+
+          bool published = false;
+
+          if (buf[0]==0x0F) {
+            i = 12;
+          }
+
+          while (i + 12 <= buf.size()) {
+            // Each item: 0x02 0x02  [class_hi class_lo  OBIS(6)  attr]  [value...]
+            if (!(buf[i]==0x02 && buf[i+1]==0x02)) { i++; continue; }
+            uint16_t class_id = (uint16_t(buf[i+2])<<8) | buf[i+3];
+            const uint8_t* ln  = &buf[i+4];
+            uint8_t attr       = buf[i+10];
+            uint8_t tag        = buf[i+11];
+            i += 12;
+
+            // ---- Register values (class=3, attr=2) ----
+            if (class_id==0x0003 && attr==0x02 && tag==0x06 && i+4 <= buf.size()) {
+              uint32_t u = (uint32_t(buf[i])<<24)|(uint32_t(buf[i+1])<<16)|(uint32_t(buf[i+2])<<8)|buf[i+3];
+              i += 4;
+
+              if      (match_obis(ln,1,0,1,7,0,255))  { id(p_total_w).publish_state((float)u); published = true; }
+              else if (match_obis(ln,1,0,21,7,0,255)) { id(p_l1_w).publish_state((float)u); published = true; }
+              else if (match_obis(ln,1,0,41,7,0,255)) { id(p_l2_w).publish_state((float)u); published = true; }
+              else if (match_obis(ln,1,0,61,7,0,255)) { id(p_l3_w).publish_state((float)u); published = true; }
+              else if (match_obis(ln,1,0,2,7,0,255))  { id(pe_total_w).publish_state((float)u); published = true; }
+              else if (match_obis(ln,1,0,22,7,0,255)) { id(pe_l1_w).publish_state((float)u); published = true; }
+              else if (match_obis(ln,1,0,42,7,0,255)) { id(pe_l2_w).publish_state((float)u); published = true; }
+              else if (match_obis(ln,1,0,62,7,0,255)) { id(pe_l3_w).publish_state((float)u); published = true; }
+              else if (match_obis(ln,1,0,1,8,0,255))  { id(e_import_kwh).publish_state((float)u / 1000.0f); published = true; }
+              else if (match_obis(ln,1,0,2,8,0,255))  { id(e_export_kwh).publish_state((float)u / 1000.0f); published = true; }
+              else if (match_obis(ln,1,0,1,8,1,255))  { id(e_imp_t1_kwh).publish_state((float)u / 1000.0f); published = true; }
+              else if (match_obis(ln,1,0,1,8,2,255))  { id(e_imp_t2_kwh).publish_state((float)u / 1000.0f); published = true; }
+              else if (match_obis(ln,1,0,1,8,3,255))  { id(e_imp_t3_kwh).publish_state((float)u / 1000.0f); published = true; }
+              else if (match_obis(ln,1,0,1,8,4,255))  { id(e_imp_t4_kwh).publish_state((float)u / 1000.0f); published = true; }
+
+              continue;
+            }
+
+            // ---- Power limiter register (class=71, attr=3) ----
+            else if (class_id==0x0047 && attr==0x03 && tag==0x06 && i+4 <= buf.size()) {
+              uint32_t u = (uint32_t(buf[i])<<24)|(uint32_t(buf[i+1])<<16)|(uint32_t(buf[i+2])<<8)|buf[i+3];
+              
+              if (match_obis(ln,0,0,17,0,0,255))  { id(p_lim).publish_state((float)u); published = true; }
+
+              i += 4;
+              continue;
+            }
+
+            // ---- Disconnect / relay status (class=70, attr=3, enum) ----
+            else if (class_id==0x0046 && attr==0x03 && tag==0x16 && i+1 <= buf.size()) {
+              uint8_t v = buf[i++];
+              if (match_obis(ln,0,0,96,3,10,255)) {id(disconnect_state).publish_state(v == 1 ? true : false); published = true;}
+              if (match_obis(ln,0,1,96,3,10,255)) {id(relay1state).publish_state(v == 1 ? true : false); published = true;}
+              if (match_obis(ln,0,2,96,3,10,255)) {id(relay2state).publish_state(v == 1 ? true : false); published = true;}
+              if (match_obis(ln,0,3,96,3,10,255)) {id(relay3state).publish_state(v == 1 ? true : false); published = true;}
+              if (match_obis(ln,0,4,96,3,10,255)) {id(relay4state).publish_state(v == 1 ? true : false); published = true;}
+              if (match_obis(ln,0,5,96,3,10,255)) {id(relay5state).publish_state(v == 1 ? true : false); published = true;}
+              if (match_obis(ln,0,6,96,3,10,255)) {id(relay6state).publish_state(v == 1 ? true : false); published = true;}
+              continue;
+            }
+
+            // ---- String values (class=1, attr=2, octet‑string) ----
+            else if (class_id==0x0001 && attr==0x02 && tag==0x09 && i+1 <= buf.size()) {
+              uint8_t L = buf[i++]; if (i+L > buf.size()) break;
+
+              if      (match_obis(ln,0,0,96,1,0,255)) {std::string s((char*)&buf[i], (char*)&buf[i]+L); id(serial).publish_state(s.c_str()); published = true;}
+              else if (match_obis(ln,0,0,96,14,0,255)) {std::string s((char*)&buf[i], (char*)&buf[i] + L); id(tariff).publish_state(s.c_str()); published = true;}
+              else if (match_obis(ln,0,0,42,0,0,255)) {std::string s((char*)&buf[i], (char*)&buf[i] + L); id(device_name).publish_state(s.c_str()); published = true;}
+              else if (match_obis(ln,0,0,96,13,0,255)) {std::string s((char*)&buf[i], (char*)&buf[i] + L); id(consumer_message).publish_state(s.c_str()); published = true;}
+              i += L;
+              continue;
+            }
+
+            // ---- Skip unknown types safely ----
+            else if (tag==0x06 && i+4 <= buf.size()) i += 4;
+            else if (tag==0x16 && i+1 <= buf.size()) i += 1;
+            else if (tag==0x09 && i+1 <= buf.size()) { uint8_t L = buf[i++]; i = std::min(i+L, buf.size()); }
+          }
+
+          if (published) {
+            id(last_frame_ok).publish_state(true);
+            id(last_frame_ms) = millis();
+          }
+
+          buf.clear();
+  
+  - interval: ${KEEPALIVE_PERIOD}
+    then:
+      - if:
+          condition:
+            switch.is_on: keepalive_led_enable
+          then:
+            - light.turn_on:
+                id: onboard_led
+                brightness: 100%
+                red: 100%
+                green: 100%
+                blue: 100%
+            - delay: ${KEEPALIVE_ON_MS}
+            - light.turn_off: onboard_led
+
+# ---------- Sensors exposed to Home Assistant ----------
+sensor:
+  - platform: template
+    id: p_total_w
+    name: "Total Active Power"
+    unit_of_measurement: "W"
+    accuracy_decimals: 0
+    device_class: power
+    state_class: measurement
+
+  - platform: template
+    id: p_l1_w
+    name: "Power L1"
+    unit_of_measurement: "W"
+    accuracy_decimals: 0
+    device_class: power
+    state_class: measurement
+
+  - platform: template
+    id: p_l2_w
+    name: "Power L2"
+    unit_of_measurement: "W"
+    accuracy_decimals: 0
+    device_class: power
+    state_class: measurement
+
+  - platform: template
+    id: p_l3_w
+    name: "Power L3"
+    unit_of_measurement: "W"
+    accuracy_decimals: 0
+    device_class: power
+    state_class: measurement
+
+  - platform: template
+    id: pe_total_w
+    name: "Total Power Export"
+    unit_of_measurement: "W"
+    accuracy_decimals: 0
+    device_class: power
+    state_class: measurement
+
+  - platform: template
+    id: pe_l1_w
+    name: "Power Export L1"
+    unit_of_measurement: "W"
+    accuracy_decimals: 0
+    device_class: power
+    state_class: measurement
+
+  - platform: template
+    id: pe_l2_w
+    name: "Power Export L2"
+    unit_of_measurement: "W"
+    accuracy_decimals: 0
+    device_class: power
+    state_class: measurement
+
+  - platform: template
+    id: pe_l3_w
+    name: "Power Export L3"
+    unit_of_measurement: "W"
+    accuracy_decimals: 0
+    device_class: power
+    state_class: measurement
+
+  - platform: template
+    id: p_lim
+    name: "Power Limiter"
+    unit_of_measurement: "W"
+    accuracy_decimals: 0
+    device_class: power
+    state_class: measurement
+
+  - platform: template
+    id: e_import_kwh
+    name: "Total Energy Import"
+    unit_of_measurement: "kWh"
+    accuracy_decimals: 3
+    device_class: energy
+    state_class: total_increasing
+
+  - platform: template
+    id: e_export_kwh
+    name: "Total Energy Export"
+    unit_of_measurement: "kWh"
+    accuracy_decimals: 3
+    device_class: energy
+    state_class: total_increasing
+
+  - platform: template
+    id: e_imp_t1_kwh
+    name: "Energy T1"
+    unit_of_measurement: "kWh"
+    accuracy_decimals: 3
+    device_class: energy
+    state_class: total_increasing
+
+  - platform: template
+    id: e_imp_t2_kwh
+    name: "Energy T2"
+    unit_of_measurement: "kWh"
+    accuracy_decimals: 3
+    device_class: energy
+    state_class: total_increasing
+
+  - platform: template
+    id: e_imp_t3_kwh
+    name: "Energy T3"
+    unit_of_measurement: "kWh"
+    accuracy_decimals: 3
+    device_class: energy
+    state_class: total_increasing
+
+  - platform: template
+    id: e_imp_t4_kwh
+    name: "Energy T4"
+    unit_of_measurement: "kWh"
+    accuracy_decimals: 3
+    device_class: energy
+    state_class: total_increasing
+
+binary_sensor:
+
+  - platform: template
+    id: disconnect_state
+    name: "Disconnect State"
+
+  - platform: template
+    id: relay1state
+    name: "Relay 1"
+
+  - platform: template
+    id: relay2state
+    name: "Relay 2"
+
+  - platform: template
+    id: relay3state
+    name: "Relay 3"
+
+  - platform: template
+    id: relay4state
+    name: "Relay 4"
+
+  - platform: template
+    id: relay5state
+    name: "Relay 5"
+
+  - platform: template
+    id: relay6state
+    name: "Relay 6"
+
+  - platform: template
+    id: last_frame_ok
+    name: "Parsing OK"
+    entity_category: diagnostic
+
+  - platform: template
+    id: meter_online
+    name: "Meter Online"
+    entity_category: diagnostic
+    lambda: |-
+      return (id(last_frame_ms) != 0) && (millis() - id(last_frame_ms) < 120000);  // 2 min
+
+text_sensor:
+  - platform: template
+    id: tariff
+    name: "Active Tariff"
+  - platform: template
+    id: serial
+    name: "Device Serial"
+  - platform: template
+    id: device_name
+    name: "Device Name"
+
+  - platform: template
+    id: consumer_message
+    name: "Message"
+    entity_category: "diagnostic"
+    
+  - platform: template
+    name: "ESPHome Version"
+    id: esphome_project_version_text_short
+    icon: "mdi:information-box"
+    entity_category: "diagnostic"
+    update_interval: 600s
+    lambda: |-
+      return { ESPHOME_VERSION };
+
+button:
+  - platform: restart
+    name: "ESP Restart"
+    id: restart_button
+    icon: "mdi:restart"
+
+time:
+  - platform: sntp
