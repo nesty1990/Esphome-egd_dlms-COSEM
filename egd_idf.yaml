@@ -31,11 +31,9 @@ wifi:
   domain: !secret wifi_domain
   power_save_mode: NONE
 
-
-# ---------- UART / RS-485 ----------
 uart:
   id: rs485
-  rx_pin: 
+  rx_pin:
     number: GPIO1 
     inverted: false
   tx_pin: 
@@ -48,8 +46,6 @@ uart:
   debug:
     direction: RX
     dummy_receiver: false
-
-# ---------- DIODA ----------
 
 light:
   - platform: esp32_rmt_led_strip
@@ -70,7 +66,6 @@ switch:
     optimistic: true
     restore_mode: "RESTORE_DEFAULT_ON"
 
-# ---------- DLMS parser ----------
 globals:
   - id: dlms_buf
     type: std::vector<uint8_t>
@@ -100,7 +95,7 @@ interval:
     then:
       - lambda: |-
           // ---------------------------------------------------------
-          // 1. INPUT HANDLING (Always runs to prevent overflow)
+          // 1. INPUT HANDLING
           // ---------------------------------------------------------
           while (id(rs485).available()) {
             uint8_t b;
@@ -115,9 +110,9 @@ interval:
           auto &buf = id(dlms_buf);
 
           // ---------------------------------------------------------
-          // 2. STATE MANAGEMENT (Start/Stop decision)
+          // 2. STATE MANAGEMENT
           // ---------------------------------------------------------
-          // If we aren't parsing, check if we should start
+          
           if (!id(is_parsing)) {
             if (buf.empty()) return;
             // Wait for 500ms silence to ensure packet is complete
@@ -137,7 +132,7 @@ interval:
           // ---------------------------------------------------------
           // 3. PARSING LOOP (Time-Sliced)
           // ---------------------------------------------------------
-          // Capture start time of this execution slice
+          
           uint32_t start_slice = millis();
 
           // Define the matcher helper
@@ -256,6 +251,7 @@ interval:
           // ---------------------------------------------------------
           // 4. CLEANUP (Only reached when buffer exhausted)
           // ---------------------------------------------------------
+          
           if (id(frame_valid)) {
              id(last_frame_ok).publish_state(true);
              id(last_frame_ms) = millis();
