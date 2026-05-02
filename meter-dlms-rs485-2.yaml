@@ -1,6 +1,11 @@
-esphome:
+substitutions:
   name: meter-dlms-rs485-2
   friendly_name: Meter DLMS RS485
+
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
 
 esp32:
   board: esp32-s3-devkitc-1 
@@ -8,11 +13,15 @@ esp32:
     type: arduino
 
 logger:
-  level: DEBUG
+  level: INFO
   logs:
     light: ERROR
 
+debug:
+  update_interval: 30s
+
 api:
+
 ota:
   - platform: esphome
 web_server:
@@ -20,8 +29,8 @@ web_server:
 wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
+  domain: !secret wifi_domain
   power_save_mode: NONE
-  reboot_timeout: 5min
 
 
 # ---------- UART / RS-485 ----------
@@ -88,7 +97,7 @@ globals:
     initial_value: 'false'
 
 interval:
-  - interval: 50ms
+  - interval: 1000ms
     then:
       - lambda: |-
           // ---------------------------------------------------------
@@ -259,33 +268,30 @@ interval:
 
   - interval: 1s
     then:
-      # 1. Toggle the pulse state (High <-> Low)
       - globals.set:
           id: led_pulse_high
           value: !lambda 'return !id(led_pulse_high);'
 
-      # 2. Check Logic Hierarchy (Red -> Yellow -> Green)
       - if:
           condition:
             not:
               wifi.connected:
           then:
-            # Case 1: WiFi Disconnected -> RED
+            # WiFi Disconnected -> RED
             - light.turn_on:
                 id: onboard_led
                 red: 1.0
                 green: 0.0
                 blue: 0.0
-                # Use lambda to switch brightness based on the global
                 brightness: !lambda 'return id(led_pulse_high) ? 1.0 : 0.3;'
-                transition_length: 800ms # Smooth fading between steps
+                transition_length: 800ms 
 
           else:
             - if:
                 condition:
                   binary_sensor.is_on: meter_online
                 then:
-                  # Case 3: Everything OK -> GREEN
+                  #  Everything OK -> GREEN
                   - light.turn_on:
                       id: onboard_led
                       red: 0.0
@@ -294,7 +300,7 @@ interval:
                       brightness: !lambda 'return id(led_pulse_high) ? 1.0 : 0.3;'
                       transition_length: 800ms
                 else:
-                  # Case 2: Meter Offline -> YELLOW
+                  # Meter Offline -> YELLOW
                   - light.turn_on:
                       id: onboard_led
                       red: 1.0
@@ -425,6 +431,32 @@ sensor:
     device_class: energy
     state_class: total_increasing
 
+  - platform: wifi_signal
+    update_interval: 60s
+    entity_category: "diagnostic"
+    name: "${friendly_name} Wifi Signal"
+
+  - platform: uptime
+    name: "${friendly_name} Uptime"
+    entity_category: "diagnostic"
+    update_interval: 60s
+    
+  - platform: internal_temperature
+    name: "${friendly_name} CPU Temperature"
+    entity_category: "diagnostic"
+    update_interval: 60s
+
+  - platform: debug
+    free:
+      name: "Heap Free"
+    loop_time:
+      name: "Loop Time"
+    cpu_frequency:
+      name: "CPU Frequency"
+      unit_of_measurement: Mhz
+      filters:
+        - multiply: 0.000001
+
 binary_sensor:
 
   - platform: template
@@ -477,20 +509,20 @@ text_sensor:
   - platform: template
     id: device_name
     name: "Device Name"
-
   - platform: template
     id: consumer_message
-    name: "Message"
-    entity_category: "diagnostic"
-    
-  - platform: template
-    name: "ESPHome Version"
-    id: esphome_project_version_text_short
-    icon: "mdi:information-box"
-    entity_category: "diagnostic"
-    update_interval: 600s
-    lambda: |-
-      return { ESPHOME_VERSION };
+    name: "Message" 
+
+
+
+  - platform: debug
+    reset_reason:
+      name: "Reset Reason"
+  - platform: wifi_info
+    ip_address:
+      name: "${friendly_name} IP"
+    mac_address:
+      name: "${friendly_name} MAC"
 
 button:
   - platform: restart
@@ -500,3 +532,4 @@ button:
 
 time:
   - platform: sntp
+
